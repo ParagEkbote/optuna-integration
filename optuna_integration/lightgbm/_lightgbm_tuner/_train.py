@@ -31,6 +31,7 @@ def train(
     study: Study | None = None,
     optuna_callbacks: list[Callable[[Study, FrozenTrial], None]] | None = None,
     model_dir: str | None = None,
+    metric_weights: dict[str, float] | None = None,
     *,
     show_progress_bar: bool = True,
     optuna_seed: int | None = None,
@@ -56,6 +57,13 @@ def train(
         <https://lightgbm.readthedocs.io/en/latest/Parameters.html>`_.
 
     Args:
+        metric_weights:
+            A dictionary of metric names to weights for multi-metric optimization.
+            If not specified, equal weights are used. This enables optimization of multiple
+            metrics simultaneously via weighted aggregation.
+            Example: ``{'binary_error': 0.3, 'auc': 0.7}`` optimizes with 30% weight on
+            minimizing error and 70% weight on maximizing AUC.
+
         time_budget:
             A time budget for parameter tuning in seconds.
 
@@ -65,7 +73,8 @@ def train(
             ``elapsed_secs`` is the elapsed time since the optimization starts.
             ``average_iteration_time`` is the average time of iteration to train the booster
             model in the trial. ``lgbm_params`` is a JSON-serialized dictionary of LightGBM
-            parameters used in the trial.
+            parameters used in the trial. ``metrics`` stores individual metric values for
+            multi-metric optimization.
 
         optuna_callbacks:
             List of Optuna callback functions that are invoked at the end of each trial.
@@ -97,6 +106,9 @@ def train(
                 The `deterministic`_ parameter of LightGBM makes training reproducible.
                 Please enable it when you use this argument.
 
+    Returns:
+        A trained :class:`~lightgbm.Booster` instance with optimized hyperparameters.
+
     .. _lightgbm.train(): https://lightgbm.readthedocs.io/en/latest/pythonapi/lightgbm.train.html
     .. _LightGBM's verbosity: https://lightgbm.readthedocs.io/en/latest/Parameters.html#verbosity
     .. _deterministic: https://lightgbm.readthedocs.io/en/latest/Parameters.html#deterministic
@@ -119,6 +131,7 @@ def train(
         study=study,
         optuna_callbacks=optuna_callbacks,
         model_dir=model_dir,
+        metric_weights=metric_weights,
         show_progress_bar=show_progress_bar,
         optuna_seed=optuna_seed,
     )

@@ -40,6 +40,7 @@ _ELAPSED_SECS_KEY = "lightgbm_tuner:elapsed_secs"
 _AVERAGE_ITERATION_TIME_KEY = "lightgbm_tuner:average_iteration_time"
 _STEP_NAME_KEY = "lightgbm_tuner:step_name"
 _LGBM_PARAMS_KEY = "lightgbm_tuner:lgbm_params"
+_METRICS_KEY = "lightgbm_tuner:metrics"  # NEW: Store all metrics
 
 # EPS is used to ensure that a sampled parameter value is in pre-defined value range.
 _EPS = 1e-12
@@ -75,10 +76,13 @@ def _get_custom_objective(lgbm_kwargs: dict[str, Any]) -> _CustomObjectiveType |
 
 
 class _BaseTuner:
+    """Base tuner class with multi-metric support."""
+
     def __init__(
         self,
         lgbm_params: dict[str, Any] | None = None,
         lgbm_kwargs: dict[str, Any] | None = None,
+        metric_weights: dict[str, float] | None = None,
     ) -> None:
         # Handling alias metrics.
         if lgbm_params is not None:
@@ -86,28 +90,43 @@ class _BaseTuner:
 
         self.lgbm_params = lgbm_params or {}
         self.lgbm_kwargs = lgbm_kwargs or {}
+        self.metric_weights = metric_weights or {}
 
-    def _get_metric_for_objective(self) -> str:
+    def _get_metrics_for_objective(self) -> list[str]:
+        """Get all metrics for optimization (multi-metric support).
+        
+        Returns:
+            List of metric names with eval_at suffix applied where needed.
+        """
         metric = self.lgbm_params.get("metric", "binary_logloss")
 
-        # todo (smly): This implementation is different logic from the LightGBM's python bindings.
+        metrics_list: list[str] = []
         if isinstance(metric, str):
-            pass
+            metrics_list = [metric]
         elif isinstance(metric, Sequence):
-            metric = metric[-1]
+            metrics_list = list(metric)
         elif isinstance(metric, Iterable):
-            metric = list(metric)[-1]
+            metrics_list = list(metric)
         else:
             raise NotImplementedError
-        metric = self._metric_with_eval_at(metric)
 
-        return metric
+        # Apply eval_at suffix for ndcg/map metrics
+        metrics_list = [self._metric_with_eval_at(m) for m in metrics_list]
+        
+        return metrics_list
 
-    def _get_booster_best_score(self, booster: "lgb.Booster") -> float:
-        metric = self._get_metric_for_objective()
-        valid_sets: list["lgb.Dataset"] | tuple["lgb.Dataset", ...] | "lgb.Dataset" | None = (
-            self.lgbm_kwargs.get("valid_sets")
-        )
+    def _get_metric_for_objective(self) -> str:
+        """Get primary (first) metric (backward compatible).
+        
+        Deprecated: Use _get_metrics_for_objective() for multi-metric support.
+        """
+        metrics = self._get_metrics_for_objective()
+        return metrics[0] if metrics else "binary_logloss"
+
+    def _get_booster_best_scores(self, booster: "lgb.Booster") -> dict[str, float]:
+        """Get best scores for all metrics as a dictionary (multi-metric support)."""
+        metrics = self._get_metrics_for_objective()
+        valid_sets = self.lgbm_kwargs.get("valid_sets")
 
         if self.lgbm_kwargs.get("valid_names") is not None:
             if isinstance(self.lgbm_kwargs["valid_names"], str):
@@ -116,19 +135,31 @@ class _BaseTuner:
                 valid_name = self.lgbm_kwargs["valid_names"][-1]
             else:
                 raise NotImplementedError
-
         elif isinstance(valid_sets, lgb.Dataset):
             valid_name = "valid_0"
-
         elif isinstance(valid_sets, Sequence) and len(valid_sets) > 0:
             valid_set_idx = len(valid_sets) - 1
             valid_name = f"valid_{valid_set_idx}"
-
         else:
             raise NotImplementedError
 
-        val_score = booster.best_score[valid_name][metric]
-        return val_score
+        scores = {}
+        for metric in metrics:
+            scores[metric] = booster.best_score[valid_name][metric]
+        
+        return scores
+
+    def _get_booster_best_score(self, booster: "lgb.Booster") -> float:
+        """Get best score (backward compatible, returns weighted aggregate).
+        
+        Deprecated: Use _get_booster_best_scores() for dict of all metrics.
+        """
+        scores = self._get_booster_best_scores(booster)
+        if len(scores) == 1:
+            return list(scores.values())[0]
+        else:
+            # Multi-metric: return weighted aggregate
+            return self._compute_weighted_score(scores)
 
     def _metric_with_eval_at(self, metric: str) -> str:
         # The parameter eval_at is only available when the metric is ndcg or map
@@ -154,19 +185,125 @@ class _BaseTuner:
             "specified."
         )
 
-    def higher_is_better(self) -> bool:
-        metric_name = self.lgbm_params.get("metric", "binary_logloss")
-        return metric_name in ("auc", "auc_mu", "ndcg", "map", "average_precision")
+    def _metric_is_higher_better(self, metric_name: str) -> bool:
+        """Check if a specific metric should be maximized.
+        
+        Args:
+            metric_name: Name of the metric (may include eval_at suffix)
+            
+        Returns:
+            True if the metric should be maximized, False if minimized.
+        """
+        # Remove eval_at suffix for checking (e.g., "ndcg@1" -> "ndcg")
+        base_metric = metric_name.split("@")[0]
+        return base_metric in ("auc", "auc_mu", "ndcg", "map", "average_precision")
 
-    def compare_validation_metrics(self, val_score: float, best_score: float) -> bool:
-        if self.higher_is_better():
-            return val_score > best_score
+    def higher_is_better(self) -> bool:
+        """Check if the primary metric should be maximized.
+        
+        Returns:
+            True if optimizing for maximum, False for minimum.
+        """
+        metrics = self._get_metrics_for_objective()
+        if not metrics:
+            return False
+        
+        primary_metric = metrics[0]
+        return self._metric_is_higher_better(primary_metric)
+
+    def _compute_weighted_score(self, scores: dict[str, float]) -> float:
+        """Compute weighted aggregate of multiple metrics.
+        
+        For metrics that should be minimized, scores are negated before weighting
+        so that all metrics are on a "higher is better" scale.
+        
+        Args:
+            scores: Dictionary mapping metric names to values.
+            
+        Returns:
+            Weighted aggregate score.
+        """
+        if not scores:
+            raise ValueError("No metrics to compute score from")
+        
+        if len(scores) == 1:
+            # Single metric - return as-is
+            return list(scores.values())[0]
+        
+        # Normalize scores to a common direction (higher is better)
+        normalized = {}
+        for metric_name, value in scores.items():
+            if self._metric_is_higher_better(metric_name):
+                # For maximize metrics, keep as-is (higher is better)
+                normalized[metric_name] = value
+            else:
+                # For minimize metrics, negate so higher is better in aggregation
+                normalized[metric_name] = -value
+        
+        # Compute weighted average
+        if self.metric_weights:
+            # User-specified weights
+            total_weight = sum(
+                self.metric_weights.get(name, 1.0) 
+                for name in normalized.keys()
+            )
+            if total_weight == 0:
+                raise ValueError("Total metric weight is zero")
+                
+            weighted_sum = sum(
+                normalized[name] * self.metric_weights.get(name, 1.0)
+                for name in normalized.keys()
+            )
+            return weighted_sum / total_weight
         else:
-            return val_score < best_score
+            # Equal weights (simple average)
+            return sum(normalized.values()) / len(normalized)
+
+    def compare_validation_metrics(
+        self, 
+        val_scores: dict[str, float] | float, 
+        best_scores: dict[str, float] | float
+    ) -> bool:
+        """Compare validation metrics to determine if a new score is better.
+        
+        Supports both single metric (float) and multi-metric (dict) for backward
+        compatibility.
+        
+        Args:
+            val_scores: Current validation score(s).
+            best_scores: Best validation score(s) so far.
+            
+        Returns:
+            True if current score is better than best, False otherwise.
+        """
+        # Type checking and conversion
+        if isinstance(val_scores, (int, float)):
+            val_dict = {"_single": float(val_scores)}
+        elif isinstance(val_scores, dict):
+            val_dict = val_scores
+        else:
+            raise TypeError(f"Unexpected type for val_scores: {type(val_scores)}")
+
+        if isinstance(best_scores, (int, float)):
+            best_dict = {"_single": float(best_scores)}
+        elif isinstance(best_scores, dict):
+            best_dict = best_scores
+        else:
+            raise TypeError(f"Unexpected type for best_scores: {type(best_scores)}")
+
+        # Compute weighted scores
+        val_weighted = self._compute_weighted_score(val_dict)
+        best_weighted = self._compute_weighted_score(best_dict)
+        
+        # Compare based on primary metric direction
+        if self.higher_is_better():
+            return val_weighted > best_weighted
+        else:
+            return val_weighted < best_weighted
 
 
 class _OptunaObjective(_BaseTuner):
-    """Objective for hyperparameter-tuning with Optuna."""
+    """Objective for hyperparameter-tuning with Optuna (multi-metric support)."""
 
     def __init__(
         self,
@@ -174,9 +311,10 @@ class _OptunaObjective(_BaseTuner):
         lgbm_params: dict[str, Any],
         train_set: "lgb.Dataset",
         lgbm_kwargs: dict[str, Any],
-        best_score: float,
+        best_score: dict[str, float] | float,
         step_name: str,
         model_dir: str | None,
+        metric_weights: dict[str, float] | None = None,
         pbar: tqdm.tqdm | None = None,
     ):
         self.target_param_names = target_param_names
@@ -184,9 +322,17 @@ class _OptunaObjective(_BaseTuner):
         self.lgbm_params = lgbm_params
         self.lgbm_kwargs = lgbm_kwargs
         self.train_set = train_set
+        self.metric_weights = metric_weights or {}
 
         self.trial_count = 0
-        self.best_score = best_score
+        
+        # Initialize best_score_dict (always use dict internally for multi-metric)
+        if isinstance(best_score, dict):
+            self.best_score_dict = best_score
+        else:
+            # Single metric: convert float to dict for consistency
+            self.best_score_dict = {"_single": float(best_score)}
+        
         self.best_booster_with_trial_number: tuple["lgb.Booster" | "lgb.CVBooster", int] | None = (
             None
         )
@@ -206,7 +352,8 @@ class _OptunaObjective(_BaseTuner):
 
     def _preprocess(self, trial: optuna.trial.Trial) -> None:
         if self.pbar is not None:
-            self.pbar.set_description(self.pbar_fmt.format(self.step_name, self.best_score))
+            best_weighted = self._compute_weighted_score(self.best_score_dict)
+            self.pbar.set_description(self.pbar_fmt.format(self.step_name, best_weighted))
 
         if "lambda_l1" in self.target_param_names:
             self.lgbm_params["lambda_l1"] = trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True)
@@ -252,7 +399,8 @@ class _OptunaObjective(_BaseTuner):
         kwargs["valid_sets"] = self._copy_valid_sets(kwargs["valid_sets"])
         booster = lgb.train(self.lgbm_params, train_set, **kwargs)
 
-        val_score = self._get_booster_best_score(booster)
+        val_scores = self._get_booster_best_scores(booster)
+        val_score_weighted = self._compute_weighted_score(val_scores)
         elapsed_secs = time.time() - start_time
         average_iteration_time = elapsed_secs / booster.current_iteration()
 
@@ -262,19 +410,24 @@ class _OptunaObjective(_BaseTuner):
                 pickle.dump(booster, fout)
             _logger.info(f"The booster of trial#{trial.number} was saved as {path}.")
 
-        if self.compare_validation_metrics(val_score, self.best_score):
-            self.best_score = val_score
+        if self.compare_validation_metrics(val_scores, self.best_score_dict):
+            self.best_score_dict = val_scores
             self.best_booster_with_trial_number = (booster, trial.number)
 
-        self._postprocess(trial, elapsed_secs, average_iteration_time)
+        self._postprocess(trial, elapsed_secs, average_iteration_time, val_scores)
 
-        return val_score
+        return val_score_weighted
 
     def _postprocess(
-        self, trial: optuna.trial.Trial, elapsed_secs: float, average_iteration_time: float
+        self,
+        trial: optuna.trial.Trial,
+        elapsed_secs: float,
+        average_iteration_time: float,
+        val_scores: dict[str, float],
     ) -> None:
         if self.pbar is not None:
-            self.pbar.set_description(self.pbar_fmt.format(self.step_name, self.best_score))
+            best_weighted = self._compute_weighted_score(self.best_score_dict)
+            self.pbar.set_description(self.pbar_fmt.format(self.step_name, best_weighted))
             self.pbar.update(1)
 
         trial.storage.set_trial_system_attr(trial._trial_id, _ELAPSED_SECS_KEY, elapsed_secs)
@@ -282,6 +435,13 @@ class _OptunaObjective(_BaseTuner):
             trial._trial_id, _AVERAGE_ITERATION_TIME_KEY, average_iteration_time
         )
         trial.storage.set_trial_system_attr(trial._trial_id, _STEP_NAME_KEY, self.step_name)
+        
+        # Store all metrics as JSON (NEW: multi-metric support)
+        metrics_dict = {k: float(v) for k, v in val_scores.items()}
+        trial.storage.set_trial_system_attr(
+            trial._trial_id, _METRICS_KEY, json.dumps(metrics_dict)
+        )
+        
         lgbm_params = copy.deepcopy(self.lgbm_params)
         custom_objective = _get_custom_objective(lgbm_params)
         if custom_objective is not None:
@@ -300,15 +460,18 @@ class _OptunaObjective(_BaseTuner):
 
 
 class _OptunaObjectiveCV(_OptunaObjective):
+    """Cross-validation objective (multi-metric support)."""
+
     def __init__(
         self,
         target_param_names: list[str],
         lgbm_params: dict[str, Any],
         train_set: "lgb.Dataset",
         lgbm_kwargs: dict[str, Any],
-        best_score: float,
+        best_score: dict[str, float] | float,
         step_name: str,
         model_dir: str | None,
+        metric_weights: dict[str, float] | None = None,
         pbar: tqdm.tqdm | None = None,
     ):
         super().__init__(
@@ -319,10 +482,45 @@ class _OptunaObjectiveCV(_OptunaObjective):
             best_score,
             step_name,
             model_dir,
+            metric_weights=metric_weights,
             pbar=pbar,
         )
 
+    def _get_cv_scores_dict(
+        self, cv_results: dict[str, list[float] | "lgb.CVBooster"]
+    ) -> dict[str, list[float]]:
+        """Extract all metric scores from CV results (multi-metric support).
+        
+        Returns:
+            Dictionary mapping metric names to lists of fold scores.
+        """
+        metrics = self._get_metrics_for_objective()
+        scores_dict = {}
+        
+        for metric_name in metrics:
+            metric_key = f"{metric_name}-mean"
+            
+            # Try both with and without "valid " prefix (LightGBM v4.0.0+)
+            if metric_key in cv_results:
+                val_scores = cv_results[metric_key]
+            elif f"valid {metric_key}" in cv_results:
+                val_scores = cv_results[f"valid {metric_key}"]
+            else:
+                raise ValueError(
+                    f"Metric '{metric_name}' not found in CV results. "
+                    f"Available keys: {list(cv_results.keys())}"
+                )
+            
+            assert not isinstance(val_scores, lgb.CVBooster)
+            scores_dict[metric_name] = val_scores
+        
+        return scores_dict
+
     def _get_cv_scores(self, cv_results: dict[str, list[float] | "lgb.CVBooster"]) -> list[float]:
+        """Get CV scores for primary metric only (backward compatible).
+        
+        Deprecated: Use _get_cv_scores_dict() for dict of all metrics.
+        """
         metric = self._get_metric_for_objective()
         metric_key = f"{metric}-mean"
         # The prefix "valid " is added to metric name since LightGBM v4.0.0.
@@ -341,10 +539,21 @@ class _OptunaObjectiveCV(_OptunaObjective):
         train_set = copy.copy(self.train_set)
         cv_results = lgb.cv(self.lgbm_params, train_set, **self.lgbm_kwargs)
 
-        val_scores = self._get_cv_scores(cv_results)
-        val_score = val_scores[-1]
+        # NEW: Multi-metric support
+        scores_dict_lists = self._get_cv_scores_dict(cv_results)
+        
+        # Get final iteration scores for each metric
+        val_scores = {
+            metric: scores_lists[-1] 
+            for metric, scores_lists in scores_dict_lists.items()
+        }
+        
+        val_score_weighted = self._compute_weighted_score(val_scores)
         elapsed_secs = time.time() - start_time
-        average_iteration_time = elapsed_secs / len(val_scores)
+        
+        # Average time per iteration (all folds combined)
+        first_metric_scores = list(scores_dict_lists.values())[0]
+        average_iteration_time = elapsed_secs / len(first_metric_scores)
 
         if self.model_dir is not None and self.lgbm_kwargs.get("return_cvbooster"):
             path = os.path.join(self.model_dir, f"{trial.number}.pkl")
@@ -356,15 +565,15 @@ class _OptunaObjectiveCV(_OptunaObjective):
                 pickle.dump((cvbooster.boosters, cvbooster.best_iteration), fout)
             _logger.info(f"The booster of trial#{trial.number} was saved as {path}.")
 
-        if self.compare_validation_metrics(val_score, self.best_score):
-            self.best_score = val_score
+        if self.compare_validation_metrics(val_scores, self.best_score_dict):
+            self.best_score_dict = val_scores
             if self.lgbm_kwargs.get("return_cvbooster"):
                 assert not isinstance(cv_results["cvbooster"], list)
                 self.best_booster_with_trial_number = (cv_results["cvbooster"], trial.number)
 
-        self._postprocess(trial, elapsed_secs, average_iteration_time)
+        self._postprocess(trial, elapsed_secs, average_iteration_time, val_scores)
 
-        return val_score
+        return val_score_weighted
 
 
 class _LightGBMBaseTuner(_BaseTuner):
@@ -388,6 +597,7 @@ class _LightGBMBaseTuner(_BaseTuner):
         sample_size: int | None = None,
         study: optuna.study.Study | None = None,
         optuna_callbacks: list[Callable[[Study, FrozenTrial], None]] | None = None,
+        metric_weights: dict[str, float] | None = None,
         *,
         show_progress_bar: bool = True,
         model_dir: str | None = None,
@@ -407,6 +617,7 @@ class _LightGBMBaseTuner(_BaseTuner):
             time_budget=time_budget,
             sample_size=sample_size,
             show_progress_bar=show_progress_bar,
+            metric_weights=metric_weights,
         )
 
         deprecated_arg_warning = (
@@ -476,6 +687,12 @@ class _LightGBMBaseTuner(_BaseTuner):
         """Return parameters of the best booster."""
         try:
             params = json.loads(self.study.best_trial.system_attrs[_LGBM_PARAMS_KEY])
+            # NEW: Include all metrics in best_params
+            metrics = json.loads(
+                self.study.best_trial.system_attrs.get(_METRICS_KEY, "{}")
+            )
+            if metrics:
+                params["best_metrics"] = metrics
         except ValueError:
             # Return the default score because no trials have completed.
             params = copy.deepcopy(_DEFAULT_LIGHTGBM_PARAMETERS)
@@ -494,6 +711,7 @@ class _LightGBMBaseTuner(_BaseTuner):
             for option_name in ["time_budget", "sample_size", "show_progress_bar"]
         }
 
+        self.metric_weights = kwargs.pop("metric_weights", {})
         # Split options.
         for option_name in self.auto_options.keys():
             if option_name in kwargs:
@@ -598,7 +816,11 @@ class _LightGBMBaseTuner(_BaseTuner):
         )
 
         # Set current best parameters.
-        self.lgbm_params.update(self.best_params)
+        best_params_filtered = {
+            k: v for k, v in self.best_params.items()
+            if k != 'best_metrics'
+        }
+        self.lgbm_params.update(best_params_filtered)
 
         train_set = self.train_set
         if self.train_subset is not None:
@@ -707,7 +929,7 @@ class LightGBMTuner(_LightGBMBaseTuner):
     5e99258>`_ by `Kohei Ozaki <https://www.kaggle.com/confirm>`_, a Kaggle Grandmaster.
 
     .. note::
-        Arguments and keyword arguments for `lightgbm.train()
+        Arguments and keyword arguments for `lightgbm.train()`
         <https://lightgbm.readthedocs.io/en/latest/pythonapi/lightgbm.train.html>`_ can be passed.
         For ``params``, please check `the official documentation for LightGBM
         <https://lightgbm.readthedocs.io/en/latest/Parameters.html>`_.
@@ -722,6 +944,12 @@ class LightGBMTuner(_LightGBMBaseTuner):
     listed below:
 
     Args:
+        metric_weights:
+            A dictionary of metric names to weights for multi-metric optimization.
+            If not specified, equal weights are used. Example:
+            ``{'binary_error': 0.3, 'auc': 0.7}`` optimizes with 30% weight on minimizing
+            error and 70% weight on maximizing AUC.
+
         time_budget:
             A time budget for parameter tuning in seconds.
 
@@ -731,7 +959,8 @@ class LightGBMTuner(_LightGBMBaseTuner):
             ``elapsed_secs`` is the elapsed time since the optimization starts.
             ``average_iteration_time`` is the average time of iteration to train the booster
             model in the trial. ``lgbm_params`` is a JSON-serialized dictionary of LightGBM
-            parameters used in the trial.
+            parameters used in the trial. ``metrics`` stores individual metric values for
+            multi-metric optimization.
 
         optuna_callbacks:
             List of Optuna callback functions that are invoked at the end of each trial.
@@ -785,6 +1014,7 @@ class LightGBMTuner(_LightGBMBaseTuner):
         study: optuna.study.Study | None = None,
         optuna_callbacks: list[Callable[[Study, FrozenTrial], None]] | None = None,
         model_dir: str | None = None,
+        metric_weights: dict[str, float] | None = None,
         *,
         show_progress_bar: bool = True,
         optuna_seed: int | None = None,
@@ -801,6 +1031,7 @@ class LightGBMTuner(_LightGBMBaseTuner):
             sample_size=sample_size,
             study=study,
             optuna_callbacks=optuna_callbacks,
+            metric_weights=metric_weights,
             show_progress_bar=show_progress_bar,
             model_dir=model_dir,
             optuna_seed=optuna_seed,
@@ -830,6 +1061,7 @@ class LightGBMTuner(_LightGBMBaseTuner):
             self.best_score,
             step_name=step_name,
             model_dir=self._model_dir,
+            metric_weights=self.metric_weights,
             pbar=pbar,
         )
 
@@ -899,6 +1131,10 @@ class LightGBMTunerCV(_LightGBMBaseTuner):
     listed below:
 
     Args:
+        metric_weights:
+            A dictionary of metric names to weights for multi-metric optimization.
+            If not specified, equal weights are used.
+
         time_budget:
             A time budget for parameter tuning in seconds.
 
@@ -908,7 +1144,8 @@ class LightGBMTunerCV(_LightGBMBaseTuner):
             ``elapsed_secs`` is the elapsed time since the optimization starts.
             ``average_iteration_time`` is the average time of iteration to train the booster
             model in the trial. ``lgbm_params`` is a JSON-serialized dictionary of LightGBM
-            parameters used in the trial.
+            parameters used in the trial. ``metrics`` stores individual metric values for
+            multi-metric optimization.
 
         optuna_callbacks:
             List of Optuna callback functions that are invoked at the end of each trial.
@@ -974,9 +1211,10 @@ class LightGBMTunerCV(_LightGBMBaseTuner):
         sample_size: int | None = None,
         study: optuna.study.Study | None = None,
         optuna_callbacks: list[Callable[[Study, FrozenTrial], None]] | None = None,
+        model_dir: str | None = None,
+        metric_weights: dict[str, float] | None = None,
         *,
         show_progress_bar: bool = True,
-        model_dir: str | None = None,
         return_cvbooster: bool = False,
         optuna_seed: int | None = None,
     ) -> None:
@@ -992,6 +1230,7 @@ class LightGBMTunerCV(_LightGBMBaseTuner):
             sample_size=sample_size,
             study=study,
             optuna_callbacks=optuna_callbacks,
+            metric_weights=metric_weights,
             show_progress_bar=show_progress_bar,
             model_dir=model_dir,
             optuna_seed=optuna_seed,
@@ -1020,6 +1259,7 @@ class LightGBMTunerCV(_LightGBMBaseTuner):
             self.best_score,
             step_name=step_name,
             model_dir=self._model_dir,
+            metric_weights=self.metric_weights,
             pbar=pbar,
         )
 
